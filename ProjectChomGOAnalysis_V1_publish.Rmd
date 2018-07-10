@@ -1,0 +1,666 @@
+---
+title: "GO, KEGG, GSEA analysis using PEL proteomics data"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(gdata)
+library(reshape2)
+library(ggplot2)
+library(factoextra)
+library(dendextend)
+library(reshape2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+# if necessary, we used the data similar to the data for heatmap and PCA analysis described in the previous section.
+# set working directory
+#setwd('C:/Users/SiSP/Desktop/Dr P/ChomPoo')
+setwd('C:/Users/patipark/Dropbox/ChomPoo')
+# get list of .csv files in the directory using "_table_Phi" pattern in the filename
+TableAUC <- read.csv('Cell_GeneNames_BC3_BCBL_GTO_TY1.csv', header = TRUE, stringsAsFactors = FALSE)
+# group by cell, select only rows with FBS treatment 
+# this will be used as a denominator for each cell lines x treatments
+# we divide each protein expression value with its own name from the control 'FBS' sample, cell-wise.
+# the so-called 'normfun' function starts here
+normfun <- function(D){
+  T1 <- TableAUC %>% group_by(Cell)
+  T2 <- TableAUC %>% group_by(Cell) %>% filter(Treatment %in% c('FBS'))
+  TC <- T1 %>% select_('Cell') %>% unique
+  
+  A <- lapply(1:dim(TC)[1], function(x) {
+    n <- TC$Cell[[x]]
+    TM <- T1 %>% filter(Cell %in% n) %>% select_('Cell','Treatment')
+    a <- T1[ grepl(n,T1$Cell),-c(1,2)]
+    b <- T2[ grepl(n,T2$Cell),-c(1,2)]
+    c <- apply(a,1,'/',b)
+    
+    d <- do.call(rbind,c)
+    
+    e <- cbind(as.data.frame(TM), as.data.frame(d)) 
+    })
+  matrix <- do.call(rbind,A)
+  return(matrix)
+} # end of the function
+# we called the result as the matrix
+matrix <- normfun(TableAUC)
+# store the matrix as new variable with selected treaments
+t3fill <- matrix %>% filter(Treatment %in% c('A4','BAY','TOFA'))
+nt <- t3fill[,-c(1,2)]    # remove columns 1,2 that are Cell and Treatment names. Only numeric elements are required in PCA analysis.
+# NA should be replaced by mean of available data using function 'f1'
+f1 <- function(vec) {
+  m <- mean(vec[is.finite(vec)])
+  vec[!is.finite(vec)] <- m
+  return(vec)
+}
+# make sure that resulting table is data frame
+Ynt <- as.data.frame(apply(nt,2,f1)) # %>% round(7) if needed, use it to round number
+########################################################
+ZV <- data.frame('Cols' = which(apply(Ynt, 2, var) == 0)) # Identify zero variance columns
+ZV$Genes <- rownames(ZV)  # make rownames as column 1
+Ynt[,ZV$Cols] <- NULL     # remove the columns with zero variance
+ZN <- colnames(Ynt)[colSums(is.na(Ynt)) > 0]  # Identify NA Inf columns
+Ynt <- Ynt[,-which(names(Ynt) %in% ZN)] # remove the columns with NAs Infs
+#head(Ynt)
+#######################################################
+```
+
+
+PCA starts here
+```{r}
+pca1 = prcomp(Ynt, scale. = TRUE)
+eigenvals <- pca1$sdev        # calculate sqrt of eigenvalues
+loadfactor <- pca1$rotation   # calculate loadings factors
+PCScores <- pca1$x   
+# The PCScores matrix is converted to a data frame with appropriate row and column names
+scores <- as.data.frame(PCScores)
+# generate combined column vector from 'Cell' + 'Treatment'
+t3fill.temp <- unite(t3fill,'Labels',c('Cell','Treatment'), remove = FALSE)
+# assign as the vector as row names
+rownames(scores) <- t3fill.temp$Labels
+#head(scores)
+```
+
+We can add PCA analysis script below
+
+Prepare data frame for heatmap
+```{r}
+# combine three tables by column together
+Ynt.1 <- cbind(t3fill$Cell, t3fill$Treatment, Ynt)
+colnames(Ynt.1)[c(1,2)] <- c('Cell','Treatment')
+D <- melt(Ynt.1, id = c('Cell','Treatment')) 
+# reshapt long table to wide table in which rows are rows are protein variables and columns are Cell_Treatment
+Dd <- dcast(D,variable~Cell+Treatment)
+# Select only rows without missing values and store as new 'mat' data frame
+mat <- Dd[complete.cases(Dd),]
+
+row.names(mat) <- mat$variable
+mat2 <- mat[,-1]
+
+library(RColorBrewer)
+library(colorRamps)
+breaksList = seq(-3, 3, by = 0.5)
+cols <- colorRamps::matlab.like(13)
+library(pheatmap)
+set.seed(1)
+hp <- pheatmap(mat2, 
+               scale = 'row',                          # rescale by row
+               clustering_method = 'ward.D2',          # method for clustering
+               clustering_distance_rows = 'euclidean', # use euclidean distance
+               clustering_distance_cols = 'euclidean', # use euclidean distance
+               cluster_rows = TRUE,                    # boolean for cluster by rows
+               cluster_cols = TRUE,                    # boolean for cluster by columns
+               cellwidth = 10,                         # set cell width
+               #cellheight = 10,                       # set cell height
+               cutree_rows = 2,                        # set break gap between rows
+               cutree_cols = 2,                        # set break gap between columns
+               show_colnames = TRUE,                   # boolean for showing column names
+               show_rownames = FALSE,                  # boolean for showing row names
+               annotation_names_col = TRUE,            # boolean for showing column annotation
+               fontsize = 5,
+               color = cols,                           # color codes used in this heatmap
+               breaks = breaksList)                    # range of each colors 
+
+```
+
+Extract data from heatmap's clustering function
+```{r}
+# create new table using data from pheatmap 
+# get access to each cluster by $tree_row as the genes are in row dimension
+mat2.order <- cbind(mat2[c(hp$tree_row[["order"]]),
+                         hp$tree_col[["order"]]],
+                    cluster = cutree(hp$tree_row, k = 2)[hp$tree_row[["order"]]])
+A <- mat2.order   # assign to new variable for easier recall
+```
+
+Now, we will enrich KEGG pathway.
+The scripts below provide fuctions necessary for GO terms splitting and mapping.
+```{r}
+# this section contains 3 functions
+# 1.geneSplit
+# 2.genemap
+# 3.myEnrichKEGG
+# this function is required to produce list of gene using chr [.] as a separator
+geneSplit <- function(varin){
+  temp <- lapply(1:length(varin), function(x) {
+                                  f <- strsplit(as.character(varin[[x]]),'[.]')
+                                  g <- do.call(cbind,f)})
+  varout <- do.call(rbind,temp)
+  return(varout)
+} # end of function
+
+# First we map the genes to ENTREZID
+# function for mapping gene start here
+genemap <- function(G){
+  id <- bitr(G, fromType = 'SYMBOL', 
+                toType = c('ENTREZID','ENSEMBL','ENSEMBLPROT','UNIPROT'), 
+                OrgDb = 'org.Hs.eg.db', drop = TRUE)
+  unique.id <- id %>% 
+    select_('SYMBOL','ENTREZID','ENSEMBL','ENSEMBLPROT','UNIPROT') %>% 
+    unique() %>% 
+    droplevels()
+  return(unique.id)
+} # end of function
+
+# now we use enrichKEGG function using ENTREZID
+# the function starts here
+myEnrichKEGG <- function(G){
+  # search for column name 'ENTREZID
+  if ('ENTREZID' %in% colnames(G)){
+    Gin <- G$ENTREZID
+  } else {
+    cat('No ENTREZID in data')}
+  ggo.kegg <- enrichKEGG(gene = Gin,
+                         organism = 'hsa',
+                         keyType = 'kegg',
+                         pvalueCutoff = 0.25,
+                         pAdjustMethod = 'fdr',
+                         minGSSize = 10,
+                         maxGSSize = 500,
+                         qvalueCutoff = 0.05,
+                         use_internal_data = FALSE)
+  c <- ggo.kegg@result # extract results from the function
+  c.sort <- c[order(-c$Count),] # reorder rows based on Count column
+  # calculate Gene Ratio (Genes/TotalGenes)
+  # from GeneRatio column, extract 'chr' before and after '/' as number while omit '/'
+  gsize <- as.numeric(sub("/\\d+$", "", as.character(c.sort$GeneRatio)))
+  gcsize <- as.numeric(sub("^\\d+/", "", as.character(c.sort$GeneRatio)))
+  c.sort$GR = gsize/gcsize # calculate GeneRatio as number and place in a new column
+  # create dotplot displaying first 20 pathways with highest counts
+  ctk <- ggplot(c.sort, aes(x = GR, # GR column on x-axis
+                                   y = reorder(Description,Count), # Description on y-axis and placed in order based on Count
+                                   color = qvalue, # qvalue as color of dot
+                                   size = Count)) + # Count as size of dot
+    geom_point() +
+    scale_colour_gradientn(colours = c('red', 'blue')) +
+    labs(x = 'Gene Ratio',
+         y = 'Enriched KEGG pathways',
+         color = 'FDR',
+         size = 'Count') +
+    theme_bw()
+  
+  output <- list('result' = c.sort,'plot' = ctk)
+  
+  return(output)
+}
+
+#KEGG analysis per condition
+#We extract genes from each treatment condition based on cell lines.
+#In each treatment,
+#1. determine significant of the expression (FC-to-control)
+#1.1 Normal distribution uses t-test
+#1.2 Non-normal distribution uses Wilcoxon rank sum
+
+# G = data frame containing:
+# rows = genes
+# columns = treatments with their expression value of each gene
+# The function will keep only treatment columns
+getKEGG <- function(G){
+  # reshape table
+  df <- G[, -which(names(G) %in% c('cluster'))] # remove non-treatment-related columns
+  List.cols <- colnames(df) # get a list of treatment
+  df.l <- lapply(seq(1, ncol(df), by = 1), function(i) df[, i]) # split data frame by column
+  # this function will do something
+  # the function starts here
+  B <- lapply(seq(1, ncol(df), by = 1), function(x) {
+    b <- data.frame('Gene' = rownames(df), 'Z' = df.l[[x]]) 
+    b$log2.Z <- log2(b$Z) # log transform z-scores to get normal distribution within column
+    b$log2.Z[which(!is.finite(b$log2.Z))] <- 0
+    # if log2Z is near 0 = little fold-change of treatment vs. control
+    # if log2Z is away from 0 = large fold-chnage of treatment vs. control
+    # H0 = fold-change is 0
+    # we calculate pvalue; if p > 0.05, we do not reject H0
+    # if p < 0.05, we reject H0 
+    SD <- 2
+    b$pval.log2.Z <- SD*pnorm(-abs(b$log2.Z)) # 2 S.D.
+    # only when pval < 0.05, we assign:
+    # up-regulated genes as 1
+    # down-regulated genes as -1, the others as 0
+    b$status <- ifelse(b$pval.log2.Z < 0.05 & b$log2.Z > 0, 1,
+                       ifelse(b$pval.log2.Z < 0.05 & b$log2.Z < 0, -1, 0))
+    # we split data into list according to status -1,0,1
+    b.split <- split(b, with(b, interaction(b$status)), drop = TRUE)
+    
+    # this function will map genes, enrich KEGG and plot figure using myenrichKEGG
+    # the function starts here
+    # D = input data frame with single status
+    # E = name of treatment
+    myfun1 <- function(D,E){
+      d <- D %>% select_('Gene') %>% 
+        unique() %>% 
+        droplevels() # select up-regulated genes
+      d.split <- geneSplit(as.character(d$Gene)) # split gene names using char [.]
+      d.gmap <- genemap(d.split) # map genes with ENTREZID, ENSEMBL, SYMBOL
+      d.gmap <- d.gmap[duplicated(d.gmap$ENTREZID == FALSE),] # remove duplicated rows using ENTREZID
+      d.kegg <- myEnrichKEGG(d.gmap)
+      st <- D$status[1]
+      d.kegg$result$status <- rep(st, dim(d.kegg$result)[1])
+      tx <- E
+      d.kegg$result$treatment <- rep(tx, dim(d.kegg$result)[1])
+      return(d.kegg)
+    }
+    
+    b.out <- lapply(seq(1, length(b), by = 1), function(n) myfun1(b,List.cols[[x]]))
+    # b.out <- lapply(seq(1, length(b.split), by = 1), function(n) mfun1(b.split[[n]],List.cols[[x]]))
+  })
+  return(B)
+}
+
+getKEGG2 <- function(G){
+  # reshape table
+  df <- G[, -which(names(G) %in% c('cluster'))] # remove non-treatment-related columns
+  df$Gene <- rownames(df)
+  d <- df %>% select_('Gene') %>% 
+    unique() %>% 
+    droplevels() # select up-regulated genes
+  d.split <- geneSplit(as.character(d$Gene)) # split gene names using char [.]
+  d.gmap <- genemap(d.split) # map genes with ENTREZID, ENSEMBL, SYMBOL
+  d.gmap <- d.gmap[duplicated(d.gmap$ENTREZID == FALSE),] # remove duplicated rows using ENTREZID
+  
+  d.kegg <- enrichKEGG(gene = d.gmap$ENTREZID,
+                         organism = 'hsa',
+                         keyType = 'kegg',
+                         pvalueCutoff = 1,
+                         pAdjustMethod = 'BH',
+                         minGSSize = 10,
+                         maxGSSize = 1000,
+                         qvalueCutoff = 1,
+                         use_internal_data = FALSE)
+  d.out <- d.kegg@result
+  gene.size <- as.numeric(sub("/\\d+$", "", as.character(d.out$GeneRatio)))
+  bg.size <- as.numeric(sub("^\\d+/", "", as.character(d.out$GeneRatio)))
+  d.out$GR <- gene.size/bg.size # calculate GeneRatio as number and place in a new column
+  d.coladd <- data.frame('GR' = d.out$GR)
+  List.col <- colnames(d.out)
+  loc.add <- which(List.col == 'GeneRatio')
+  loc.drop <- which(List.col == 'GR')
+  d.out[,loc.drop] <- NULL
+  d.out <- as.data.frame(append(d.out,d.coladd , after = loc.add))
+  
+  addSYMBOL(d.out)
+}
+
+# this funtion will convert ENTRIZID to SYMBOL or vice versa
+# D = data table from enrichKEGG containing 'geneID' column 
+# ie.convert '9999/3245/2345/098813' to 'AAYB/UBQA/EIF4A/RNASP' 
+addSYMBOL <- function(D){
+  List.col <- colnames(D)
+  loc <- which(List.col == 'geneID')
+  mi <- D[,loc]
+  mt <- strsplit(as.character(mi),'[/]')
+  sym.list <- lapply(1:length(mt), function(x) {
+    m <- lapply(1:length(mt[[x]]), function(y) mt[[x]][[y]])
+    ms <- do.call(cbind,m)
+    mc <- bitr(ms, fromType = 'ENTREZID', toType = 'SYMBOL', OrgDb = 'org.Hs.eg.db')
+    ml <- paste0(mc$SYMBOL, collapse = '/')
+  })
+  sym.col <- data.frame( 'geneSYMBOL' = do.call(rbind,sym.list))
+  Dd <- as.data.frame(append(D, sym.col, after = loc))
+  return(Dd)
+}
+
+```
+
+Run function to get list of KEGG pathways
+```{r message=FALSE, warning=FALSE}
+######################
+# just take whole gene list for enrichKEGG
+B.results <- getKEGG2(A)
+
+#head(B.results)
+```
+
+Screen for KEGG pathway names containing 'signaling pathway'
+```{r}
+# subset only signaling pathways
+Sig <- B.results %>% filter(grepl('.*signaling pathway',Description)) %>% droplevels()
+# create new column with shorter Description
+library(tm) # NLP package
+mi <- Sig$Description
+mt <- removeWords(as.character(mi),'signaling pathway')
+loc.add <- which(colnames(Sig) == 'Description')
+Sig <- as.data.frame(append(Sig, data.frame('ShortDescription' = mt), after = loc.add))
+# log2 transform p.adjust.value
+mi <- -log2(Sig$p.adjust)
+loc.add <- which(colnames(Sig) == 'p.adjust')
+Sig <- as.data.frame(append(Sig, data.frame('log2.p.adjust' = mi), after = loc.add))
+```
+
+Create first doplot showing GeneRatio and p.adjust.value of enriched KEGG pathway.
+Ranking by p.adjust.value from high to low.
+```{r}
+library(RColorBrewer)
+CC <- c('#ffffb2','#fecc5c','#fd8d3c','#f03b20','#bd0026')
+range.cc <- length(CC)
+min.p <- min(Sig$log2.p.adjust)
+max.p <- max(Sig$log2.p.adjust)
+range.p <- range(max.p - min.p)/range.cc
+breaksList <- seq(min.p,max.p, by = range.cc)
+
+#Sig.sort <- Sig[order(Sig$p.adjust),]
+ct_fig <- ggplot(Sig, aes(x = log2.p.adjust, # GR column on x-axis
+                y = reorder(ShortDescription,log2.p.adjust), # Description on y-axis and placed in order based on Count
+                color = log2.p.adjust, # qvalue as color of dot
+                size = GR*100)) + # Count as size of dot
+  geom_point(aes(fill = log2.p.adjust), colour = 'black',pch = 21) +
+  geom_vline(xintercept = -log2(0.05), 
+             #linetype = 'dotted', 
+             color = 'red',
+             size = 1) +
+  #scale_x_reverse() +
+  scale_fill_gradientn(colors = CC, breaks = breaksList, labels = breaksList)  +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = max.p+1)) +
+  # scale_x_discrete(limits = c('BCBL_A4','TY1_A4','TY1_BAY',
+  #                             'GTO_A4','GTO_BAY','BCBL_BAY',
+  #                             'BC3_A4','BC3_BAY','BC3_TOFA',
+  #                             'BCBL_TOFA','GTO_TOFA','TY1_TOFA')) +
+  guides(fill = FALSE) +
+  # guides(fill = guide_legend(title.theme = element_text(size = 10,
+  #                                                       face = 'plain',
+  #                                                       colour = 'black',
+  #                                                       angle = 0,
+  #                                                       vjust = 1))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(face = 'plain', color = 'black', 
+                                   size = 10, angle = 0)) +
+  labs(x = expression(-log[2]~(Adj.p-value)),
+       y = 'Enriched KEGG pathways',
+       size = 'Gene Ratio (%)')
+
+ct_fig
+```
+
+Significant enriched KEGG pathway may be use in further analysis for relevant pathways in a particular condition.
+
+We rank again accoring to GeneRatio (the number of genes falling within a KEGG pathway).
+```{r}
+library(RColorBrewer)
+CC <- c('#ffffb2','#fecc5c','#fd8d3c','#f03b20','#bd0026')
+range.cc <- length(CC)
+min.p <- min(Sig$log2.p.adjust)
+max.p <- max(Sig$log2.p.adjust)
+range.p <- range(max.p - min.p)/range.cc
+breaksList <- seq(min.p,max.p, by = range.cc)
+
+#Sig.sort <- Sig[order(Sig$p.adjust),]
+ct_fig2 <- ggplot(Sig, aes(x = log2.p.adjust, # GR column on x-axis
+                y = reorder(ShortDescription,GR), # Description on y-axis and placed in order based on Count
+                color = log2.p.adjust, # qvalue as color of dot
+                size = GR*100)) + # Count as size of dot
+  geom_point(aes(fill = log2.p.adjust), colour = 'black',pch = 21) +
+  geom_vline(xintercept = -log2(0.05),
+             #linetype = 'dotted',
+             color = 'red',
+             size = 1) +
+  #scale_x_reverse() +
+  scale_fill_gradientn(colors = CC, breaks = breaksList, labels = breaksList)  +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = max.p+1)) +
+  # scale_x_discrete(limits = c('BCBL_A4','TY1_A4','TY1_BAY',
+  #                             'GTO_A4','GTO_BAY','BCBL_BAY',
+  #                             'BC3_A4','BC3_BAY','BC3_TOFA',
+  #                             'BCBL_TOFA','GTO_TOFA','TY1_TOFA')) +
+  guides(fill = FALSE) +
+  #guides(size = FALSE) +
+  # guides(fill = guide_legend(title.theme = element_text(size = 10,
+  #                                                       face = 'plain',
+  #                                                       colour = 'black',
+  #                                                       angle = 0,
+  #                                                       vjust = 1))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(face = 'plain', color = 'black', 
+                                   size = 10, angle = 0)) +
+  labs(x = expression(-log[2]~(Adj.p-value)),
+       y = 'Enriched KEGG pathways',
+       size = 'Gene Ratio (%)')
+
+ct_fig2
+```
+
+Prepare data for gseKEGG analysis using the function provided below.
+```{r}
+# This function will create geneList suitable for pathview package
+# according to GC Yu's blog post,
+# we create geneList with head = KEGG_ID, value = expression level
+# M = data frame with rows = genes, columns = treatment
+myGeneList <- function(M){
+  G <- M
+  ColNames <- colnames(G)
+  if ('cluster' %in% ColNames){
+    df <- G[,!names(G) %in% c('cluster') == TRUE]
+  } else {
+    df <- G
+  }# remove non-treatment-related columns
+  # get a list of treatment
+  List.cols <- colnames(df)
+  # this function will do something
+  # the function starts here
+  B <- lapply(seq(1:dim(df)[2]), function(n) {
+    h <- data.frame('SYMBOL' = rownames(df), 'value' = df[,List.cols[n]])
+    rownames(h) <- rownames(df)
+    # this function will truncate any letters after [.] in the gene names with multiple AA fractions
+    # ie. aaaa.aaab.aabc -> aaaa
+    dropReps <- function(varin){
+      temp <- lapply(1:length(varin), function(x) {
+        f <- gsub("\\..*","",as.character(varin[[x]]))})
+      varout <- do.call(rbind,temp)
+      return(varout)
+    }
+    # Now we will truncate long SYMBOL
+    h$SYMBOL <- dropReps(h$SYMBOL)
+    id <- genemap(h$SYMBOL) # map SYMBOL with hsa database
+    List.id <- unique(id$ENTREZID) # some SYMBOL may return similar ENTREZID, we need unique ENTREZID
+    # now we will use List.id as a provider of unique ENTREZID,
+    # then, we select data (SYMBOL, ENTREZID) from 'id' gene mapping table
+    sel <- id %>% filter(ENTREZID %in% List.id) %>% select_('SYMBOL','ENTREZID') %>% unique()
+    # merge columns by rows based on similar SYMBOL
+    # resulting in a data frame with unique sYMBOL, ENTREZID, protein expression value
+    hh <- merge(sel,h, by = 'SYMBOL', all = TRUE)
+    # if there are repeat ENTREZID rows, we calculate mean of protein expression value
+    h3 <- setDT(hh)[, mean(value), by = c('SYMBOL','ENTREZID')]
+    colnames(h3)[3] <- 'value'
+    # in order to be used in gseKEGG function, data must be sorted in descending order (max -> min values)
+    v <- log2(h3$value) # create a vector of protein expression values
+    v[!is.finite(v)] <- 0
+    names(v) <- h3$ENTREZID # add 'name' attribute to the vector
+    vin <- sort(v,decreasing = TRUE) # sort vector
+  })
+}
+```
+
+Prepare gene+expression level suitable for the function.
+```{r message=FALSE, warning=FALSE}
+B <- myGeneList(mat2)
+head(B[[1]])
+```
+
+Now we run tha gseKEGG analysis.
+```{r message=FALSE, warning=FALSE}
+kk2 <- lapply(1:length(B), function(n) gseKEGG(geneList = B[[n]],  # order ranked geneList
+                                               organism = 'hsa',
+                                               keyType = 'kegg', # 'kegg', 'ncbi-geneid','ncbi-proteinid', 'uniprot'
+                                               exponent = 1, # weight of each step
+                                               nPerm = 1000, # permutation numbers
+                                               minGSSize = 10, # minimal size of each geneSet for analyzing
+                                               maxGSSize = 1000, # maximal size of gene annotated for testing
+                                               pvalueCutoff = 1, # pvalue cutoff
+                                               pAdjustMethod = 'fdr', # pvalue adjustment method ( "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none")
+                                               verbose = FALSE, # print message or not
+                                               use_internal_data = FALSE, # logical, use KEGG.db or latest online KEGG data
+                                               seed = FALSE)) # logical
+```
+
+We extract data frame containing KEGG pathways, enrichment scores etc.
+```{r}
+temp <- lapply(seq(1,length(kk2),by = 1), function(i) {kk2[[i]]@result %>% select_('NES')})
+NES.cols <- do.call(cbind,temp)
+colnames(NES.cols) <- colnames(mat2)
+
+ID.cols <- kk2[[1]]@result %>% select_('ID','Description')
+
+fin.cols <- cbind(ID.cols, NES.cols) # NES matrix
+head(fin.cols)
+```
+
+Prepare data frame for pheatmap function
+```{r}
+mat3 <- fin.cols[,-c(1,2)] # prepare input matrix for pheatmap
+
+library(RColorBrewer)
+library(colorRamps)
+breaksList = seq(-2, 2, by = 4/11)
+cols <- rev(RColorBrewer::brewer.pal(11,'RdYlGn'))
+
+library(pheatmap)
+hp2 <- pheatmap(mat3, 
+               scale = 'row',        # 'row' 'column' 'none'
+               cluster_rows = TRUE,                    # boolean for cluster by rows
+               cluster_cols = TRUE,                    # boolean for cluster by columns
+               clustering_method = 'ward.D2',          # method for clustering
+               clustering_distance_rows = 'euclidean', # use euclidean distance
+               clustering_distance_cols = 'euclidean', # use euclidean distance
+               cellwidth = 10,                         # set cell width
+               #cellheight = 10,                       # set cell height
+               #cutree_rows = 4,                        # set break gap between rows
+               #cutree_cols = 5,                        # set break gap between columns
+               show_colnames = TRUE,                   # boolean for showing column names
+               show_rownames = TRUE,                  # boolean for showing row names
+               annotation_names_col = TRUE,            # boolean for showing column annotation
+               fontsize = 5,
+               color = cols,                           # color codes used in this heatmap
+               breaks = breaksList)
+```
+
+Select specific pathways and plot heatmap again.
+```{r}
+f.Sig <- fin.cols %>% filter(grepl('.*signaling pathway',Description)) %>% droplevels()
+library(tm) # NLP package
+mi <- f.Sig$Description
+mt <- removeWords(as.character(mi),'signaling pathway')
+loc.add <- which(colnames(Sig) == 'Description')
+f.Sig <- as.data.frame(append(f.Sig, data.frame('ShortDescription' = mt), after = loc.add))
+mat4 <- f.Sig[,-c(1:3)]
+rownames(mat4) <- f.Sig$ShortDescription
+
+library(RColorBrewer)
+library(colorRamps)
+breaksList = seq(-2, 2, by = 4/11)
+cols <- rev(RColorBrewer::brewer.pal(11,'RdYlGn'))
+
+library(pheatmap)
+hp3 <- pheatmap(mat4, 
+               scale = 'row',        # 'row' 'column' 'none'
+               cluster_rows = TRUE,                    # boolean for cluster by rows
+               cluster_cols = TRUE,                    # boolean for cluster by columns
+               clustering_method = 'ward.D2',          # method for clustering
+               clustering_distance_rows = 'euclidean', # use euclidean distance
+               clustering_distance_cols = 'euclidean', # use euclidean distance
+               cellwidth = 10,                         # set cell width
+               #cellheight = 10,                       # set cell height
+               #cutree_rows = 4,                        # set break gap between rows
+               #cutree_cols = 5,                        # set break gap between columns
+               show_colnames = TRUE,                   # boolean for showing column names
+               show_rownames = TRUE,                  # boolean for showing row names
+               annotation_names_col = TRUE,            # boolean for showing column annotation
+               fontsize = 5,
+               color = cols,                           # color codes used in this heatmap
+               breaks = breaksList)
+```
+
+Now, we want to find similarity of each cell+drug pair.
+Correlation is calculated and display as a correlation matrix.
+Correlation matrix
+```{r}
+# NES-based correlation
+# scale NES value across treatment conditions
+scaled.mat <- apply(fin.cols[,-c(1:2)],2, scale)
+# assign to new variable
+mtx <- scaled.mat[,-c(1:2)]
+
+corr <- cor(mtx, 
+            #na.rm = FALSE,
+            use = 'everything',
+            method = 'spearman') # compute correlation matrix
+
+# reorder cor mat
+reorder_cormat <- function(cormat){
+# Use correlation between variables as distance
+dd <- as.dist((1-cormat)/2)
+hc <- hclust(dd)
+cormat <-cormat[hc$order, hc$order]
+}
+# use reorder_cormat function
+cormat <- reorder_cormat(corr)
+
+m.corr <- melt(cormat)
+
+f_corr <- ggplot(m.corr, aes(Var1, Var2, fill = value)) +
+  geom_tile(height = 0.8, width = 0.8) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name = "Spearman\nCorrelation") +
+  theme_minimal() +
+  coord_equal() +
+  labs(x = "",y = "",fill = "Corr") +
+  theme(axis.text.x = element_text(size = 8, angle = 45, vjust = 1, hjust = 1, 
+                                   margin = margin(-3,0,0,0)),
+        axis.text.y = element_text(size = 8, margin = margin(0,-3,0,0)),
+        panel.grid.major = element_blank())
+f_corr
+```
+
+From correlation matrix, we found that cells trated with STATi were clustered together, suggesting their high similarity degree of protein expression profile.
+
+Next step, we will measure distance between each treatment in a particular cell line.
+```{r}
+# Prepare a data frame
+a <- TableAUC
+nt <- a[,-c(1,2)]    # remove columns 1,2 that are Cell and Treatment names. Only numeric elements are required in PCA analysis.
+# NA should be replaced by mean of available data using function 'f1'
+f1 <- function(vec) {
+  m <- mean(vec[is.finite(vec)])
+  vec[!is.finite(vec)] <- m
+  return(vec)
+}
+# make sure that resulting table is data frame
+Ynt <- as.data.frame(apply(nt,2,f1)) # %>% round(7) if needed, use it to round number
+########################################################
+ZV <- data.frame('Cols' = which(apply(Ynt, 2, var) == 0)) # Identify zero variance columns
+if (is.data.frame(ZV) && nrow(ZV) != 0){  
+  ZV$Genes <- rownames(ZV)  # make rownames as column 1
+  Ynt[,ZV$Cols] <- NULL     # remove the columns with zero variance
+}
+ZN <- colnames(Ynt)[colSums(is.na(Ynt)) > 0]  # Identify NA Inf columns
+if (length(ZN) == 0) {
+  Ynt <- Ynt[,-which(names(Ynt) %in% ZN)] # remove the columns with NAs Infs
+} else {
+  Ynt <- Ynt
+}
+
+#Ynt[1:5,1:5]
+
+```
+
